@@ -1,0 +1,19 @@
+services:
+  market-adjust-api:
+    build: .
+    image: market-adjust-api:latest
+    container_name: market-adjust-api
+    ports:
+      - "8000:8000"
+    environment:
+      MARKET_DB_PATH: /data/market.db
+    volumes:
+      - market-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  market-data:
