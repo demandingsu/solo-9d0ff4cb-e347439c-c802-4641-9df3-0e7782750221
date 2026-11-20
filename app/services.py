@@ -19,16 +19,26 @@ from decimal import ROUND_HALF_UP, Decimal
 from . import db
 from .models import (
     AdjustedQuote,
+    AllocationOut,
     BatchOut,
     CorporateActionIn,
     CorporateActionOut,
     EventBasis,
+    PositionOut,
+    PostingOut,
+    PostingRequest,
+    PostingResponse,
     QuoteIn,
     RawQuote,
+    TradeIn,
+    TradeOut,
+    WorksheetOut,
 )
 
 # 折算值保留 5 位小数（ROUND_HALF_UP，金融惯例）
 QUANT = Decimal("0.00001")
+# 金额单位：分
+CENT = Decimal("0.01")
 
 
 class Rejected(Exception):
@@ -485,3 +495,428 @@ def query_actions(
             (cutoff_id, cutoff_id, code),
         ).fetchall()
     return [CorporateActionOut(**dict(r)) for r in rows]
+
+
+# ---------------------------------------------------------------- 入账（交割单核对）
+#
+# 不变量
+# ======
+# 1. 成交只追加：同（账户, 证券, 成交号）同值幂等跳过，异值整次拒收。
+# 2. 每次入账在单个写事务内「补录成交 + 全量重算 + 写底稿」；
+#    结账日早于任一成交日、重算股数不足或写入失败 => 整体回滚，
+#    不留成交、不留入账批次，上次成功入账的底稿仍可查询。
+# 3. 重算口径：全部已入库成交按（交易日, 成交号）排序；除权日先按
+#    截至 cutoff_batch 的有效公告调整各买入批次剩余股数（保留碎股，
+#    剩余成本不变），再处理当日成交；卖出按买入先后（FIFO）逐批扣股。
+
+
+def _to_cents(value: float | str) -> Decimal:
+    """金额量化到分（ROUND_HALF_UP）。"""
+    return Decimal(str(value)).quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def _trade_signature(t: TradeIn) -> tuple:
+    amt = None if t.amount is None else _to_cents(t.amount)
+    return (t.trade_date, t.direction, Decimal(str(t.shares)), amt)
+
+
+def _db_trade_signature(row: sqlite3.Row) -> tuple:
+    amt = None if row["amount"] is None else _to_cents(row["amount"])
+    return (row["trade_date"], row["direction"], Decimal(str(row["shares"])), amt)
+
+
+def normalize_trades(rows: Iterable[TradeIn]) -> dict[str, TradeIn]:
+    """同一请求内按成交号归一化：同号同值去重，同号异值拒收。"""
+    chosen: dict[str, TradeIn] = {}
+    for row in rows:
+        old = chosen.get(row.trade_no)
+        if old is not None:
+            if _trade_signature(old) != _trade_signature(row):
+                raise Rejected(
+                    f"同号异值拒收：成交号 {row.trade_no} 在本次入账中出现不同值"
+                )
+            continue  # 同号同值：只记一次
+        chosen[row.trade_no] = row
+    return chosen
+
+
+def _resolve_posting_cutoff(conn: sqlite3.Connection, cutoff: int | None) -> int:
+    """入账采用的公告截止批次：缺省取最新批次；库中无批次时为 0（不用公告）。"""
+    if cutoff is None:
+        row = conn.execute("SELECT MAX(id) AS m FROM ingest_batches").fetchone()
+        return int(row["m"]) if row["m"] is not None else 0
+    if cutoff == 0:
+        return 0
+    exists = conn.execute(
+        "SELECT 1 FROM ingest_batches WHERE id = ?", (cutoff,)
+    ).fetchone()
+    if exists is None:
+        raise Rejected(f"公告截止批次 {cutoff} 不存在", 404)
+    return cutoff
+
+
+def _effective_actions_until(
+    conn: sqlite3.Connection, code: str, closing_date: str, cutoff: int
+) -> list[sqlite3.Row]:
+    """截至 cutoff 已入库、除权日不晚于结账日的有效公告（每事件号最高修订）。"""
+    return conn.execute(
+        """
+        SELECT a.event_no, a.ex_date, a.ratio, a.action_type,
+               a.revision, a.ingest_batch_id
+        FROM corporate_actions a
+        JOIN (
+            SELECT security_code, event_no, MAX(revision) AS max_rev
+            FROM corporate_actions
+            WHERE ingest_batch_id <= ?
+            GROUP BY security_code, event_no
+        ) m ON m.security_code = a.security_code
+           AND m.event_no = a.event_no
+           AND a.revision = m.max_rev
+        WHERE a.ingest_batch_id <= ?
+          AND a.security_code = ?
+          AND a.ex_date <= ?
+        ORDER BY a.ex_date, a.event_no
+        """,
+        (cutoff, cutoff, code, closing_date),
+    ).fetchall()
+
+
+def _replay(
+    all_trades: list[tuple[str, str, str, Decimal, Decimal | None]],
+    action_rows: list[sqlite3.Row],
+) -> tuple[list[dict], list[dict], int, Decimal]:
+    """按时间重放成交与公告，返回 (扣减明细, 结账日头寸, 卖出笔数, 结转成本合计)。
+
+    all_trades 须已按（交易日, 成交号）排序：
+    (trade_no, trade_date, direction, shares, amount)，股数/金额为 Decimal。
+    """
+    actions_by_date: dict[str, list[sqlite3.Row]] = {}
+    for a in action_rows:
+        actions_by_date.setdefault(a["ex_date"], []).append(a)
+    trades_by_date: dict[str, list[tuple]] = {}
+    for t in all_trades:
+        trades_by_date.setdefault(t[1], []).append(t)
+
+    # 买入批次（lot）：按买入先后排队，剩余股数/剩余成本用 Decimal 全程精算
+    lots: list[dict] = []
+    allocations: list[dict] = []
+    sells = 0
+    carried_total = Decimal("0")
+
+    for day in sorted(set(actions_by_date) | set(trades_by_date)):
+        # 除权日：先调整各笔剩余股数（保留碎股），剩余成本不变
+        for a in actions_by_date.get(day, []):
+            ratio = Decimal(str(a["ratio"]))
+            for lot in lots:
+                lot["shares"] *= ratio
+        # 再处理当日成交（已按成交号排序）
+        for trade_no, trade_date, direction, shares, amount in trades_by_date.get(
+            day, []
+        ):
+            if direction == "buy":
+                lots.append(
+                    {
+                        "trade_no": trade_no,
+                        "trade_date": trade_date,
+                        "shares": shares,
+                        "cost": amount,
+                    }
+                )
+                continue
+            sells += 1
+            need = shares
+            while need > 0:
+                lot = next((x for x in lots if x["shares"] > 0), None)
+                if lot is None:
+                    raise Rejected(
+                        f"股数不足：卖出 {trade_no}（{trade_date}）还差 {need} 股"
+                        "无买入来源，整次入账作废"
+                    )
+                take = min(need, lot["shares"])
+                if take == lot["shares"]:
+                    cost = lot["cost"]  # 扣完一批：结转全部剩余成本
+                else:
+                    # 按扣减股数占该批剩余股数的比例结转，四舍五入到分
+                    cost = (lot["cost"] * take / lot["shares"]).quantize(
+                        CENT, rounding=ROUND_HALF_UP
+                    )
+                lot["shares"] -= take
+                lot["cost"] -= cost
+                need -= take
+                carried_total += cost
+                allocations.append(
+                    {
+                        "sell_trade_no": trade_no,
+                        "sell_trade_date": trade_date,
+                        "buy_trade_no": lot["trade_no"],
+                        "buy_trade_date": lot["trade_date"],
+                        "shares_deducted": take,
+                        "cost_carried": cost,
+                    }
+                )
+
+    positions = [
+        {
+            "buy_trade_no": lot["trade_no"],
+            "buy_trade_date": lot["trade_date"],
+            "remaining_shares": lot["shares"],
+            "remaining_cost": lot["cost"],
+        }
+        for lot in lots
+    ]
+    return allocations, positions, sells, carried_total
+
+
+def create_posting(req: PostingRequest, db_file: str | None = None) -> dict:
+    """入账：补录成交并按指定公告截止批次全量重算，写底稿。
+
+    任一校验或写入失败 => 整个事务回滚（整次入账作废）。
+    """
+    normalized = normalize_trades(req.trades)
+    with db.get_conn(db_file) as conn:
+        try:
+            with db.write_transaction(conn):
+                _ensure_securities(conn, {req.security_code})
+                cutoff_id = _resolve_posting_cutoff(conn, req.cutoff_batch)
+
+                existing_rows = conn.execute(
+                    "SELECT trade_no, trade_date, direction, shares, amount "
+                    "FROM trades WHERE account = ? AND security_code = ?",
+                    (req.account, req.security_code),
+                ).fetchall()
+                existing_by_no = {r["trade_no"]: r for r in existing_rows}
+
+                # 归并补录成交：同号同值幂等跳过，同号异值拒收
+                new_trades: list[TradeIn] = []
+                for trade_no, t in normalized.items():
+                    old = existing_by_no.get(trade_no)
+                    if old is not None:
+                        if _db_trade_signature(old) != _trade_signature(t):
+                            raise Rejected(
+                                f"同号异值拒收：成交号 {trade_no} 已入库不同值，"
+                                "整次入账作废"
+                            )
+                        continue
+                    new_trades.append(t)
+
+                # 全量成交（已入库 + 本次新录），股数/金额转 Decimal
+                all_trades: list[tuple[str, str, str, Decimal, Decimal | None]] = [
+                    (
+                        r["trade_no"],
+                        r["trade_date"],
+                        r["direction"],
+                        Decimal(str(r["shares"])),
+                        None if r["amount"] is None else _to_cents(r["amount"]),
+                    )
+                    for r in existing_rows
+                ]
+                all_trades += [
+                    (
+                        t.trade_no,
+                        t.trade_date,
+                        t.direction,
+                        Decimal(str(t.shares)),
+                        None if t.amount is None else _to_cents(t.amount),
+                    )
+                    for t in new_trades
+                ]
+
+                # 结账日不得早于任一成交日
+                if all_trades:
+                    latest_trade_date = max(t[1] for t in all_trades)
+                    if req.closing_date < latest_trade_date:
+                        raise Rejected(
+                            f"结账日 {req.closing_date} 早于成交日 "
+                            f"{latest_trade_date}，整次入账作废"
+                        )
+
+                # 成交按交易日、成交号排序
+                all_trades.sort(key=lambda t: (t[1], t[0]))
+
+                action_rows = _effective_actions_until(
+                    conn, req.security_code, req.closing_date, cutoff_id
+                )
+                allocations, positions, sells, carried_total = _replay(
+                    all_trades, action_rows
+                )
+
+                # 全部计算通过后一次性落库（同事务）
+                cur = conn.execute(
+                    "INSERT INTO postings(account, security_code, closing_date, "
+                    "cutoff_batch, trades_received, trades_new, sells_processed, "
+                    "cost_carried) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        req.account,
+                        req.security_code,
+                        req.closing_date,
+                        cutoff_id,
+                        len(req.trades),
+                        len(new_trades),
+                        sells,
+                        float(carried_total),
+                    ),
+                )
+                posting_id = cur.lastrowid
+
+                conn.executemany(
+                    "INSERT INTO trades(account, security_code, trade_no, "
+                    "trade_date, direction, shares, amount, posting_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            req.account,
+                            req.security_code,
+                            t.trade_no,
+                            t.trade_date,
+                            t.direction,
+                            t.shares,
+                            t.amount,
+                            posting_id,
+                        )
+                        for t in new_trades
+                    ],
+                )
+                conn.executemany(
+                    "INSERT INTO posting_allocations(posting_id, sell_trade_no, "
+                    "sell_trade_date, buy_trade_no, buy_trade_date, "
+                    "shares_deducted, cost_carried) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            posting_id,
+                            a["sell_trade_no"],
+                            a["sell_trade_date"],
+                            a["buy_trade_no"],
+                            a["buy_trade_date"],
+                            float(a["shares_deducted"]),
+                            float(a["cost_carried"]),
+                        )
+                        for a in allocations
+                    ],
+                )
+                conn.executemany(
+                    "INSERT INTO posting_positions(posting_id, buy_trade_no, "
+                    "buy_trade_date, remaining_shares, remaining_cost) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (
+                            posting_id,
+                            p["buy_trade_no"],
+                            p["buy_trade_date"],
+                            float(p["remaining_shares"]),
+                            float(p["remaining_cost"]),
+                        )
+                        for p in positions
+                    ],
+                )
+        except sqlite3.IntegrityError as exc:
+            # 唯一索引兜底：并发入账同一成交号时其中一个事务在此失败
+            raise Rejected(f"入账写入与已入库数据冲突，整次作废：{exc}", 409) from exc
+
+    return {
+        "posting_id": posting_id,
+        "account": req.account,
+        "security_code": req.security_code,
+        "closing_date": req.closing_date,
+        "cutoff_batch": cutoff_id,
+        "trades_received": len(req.trades),
+        "trades_new": len(new_trades),
+        "trades_total": len(all_trades),
+        "sells_processed": sells,
+        "cost_carried": float(carried_total),
+    }
+
+
+def list_postings(
+    account: str | None = None,
+    security_code: str | None = None,
+    db_file: str | None = None,
+) -> list[PostingOut]:
+    sql = (
+        "SELECT id, account, security_code, closing_date, cutoff_batch, "
+        "trades_received, trades_new, sells_processed, cost_carried, created_at "
+        "FROM postings"
+    )
+    cond, params = [], []
+    if account is not None:
+        cond.append("account = ?")
+        params.append(account)
+    if security_code is not None:
+        cond.append("security_code = ?")
+        params.append(security_code)
+    if cond:
+        sql += " WHERE " + " AND ".join(cond)
+    sql += " ORDER BY id"
+    with db.get_conn(db_file) as conn, db.read_snapshot(conn):
+        rows = conn.execute(sql, params).fetchall()
+    return [
+        PostingOut(posting_id=r["id"], **{k: r[k] for k in r.keys() if k != "id"})
+        for r in rows
+    ]
+
+
+def _worksheet_for(conn: sqlite3.Connection, posting: sqlite3.Row) -> WorksheetOut:
+    allocs = conn.execute(
+        "SELECT sell_trade_no, sell_trade_date, buy_trade_no, buy_trade_date, "
+        "shares_deducted, cost_carried FROM posting_allocations "
+        "WHERE posting_id = ? ORDER BY id",
+        (posting["id"],),
+    ).fetchall()
+    positions = conn.execute(
+        "SELECT buy_trade_no, buy_trade_date, remaining_shares, remaining_cost "
+        "FROM posting_positions WHERE posting_id = ? ORDER BY id",
+        (posting["id"],),
+    ).fetchall()
+    return WorksheetOut(
+        posting_id=posting["id"],
+        account=posting["account"],
+        security_code=posting["security_code"],
+        closing_date=posting["closing_date"],
+        cutoff_batch=posting["cutoff_batch"],
+        sells_processed=posting["sells_processed"],
+        cost_carried=posting["cost_carried"],
+        created_at=posting["created_at"],
+        allocations=[AllocationOut(**dict(a)) for a in allocs],
+        positions=[PositionOut(**dict(p)) for p in positions],
+    )
+
+
+def get_worksheet(posting_id: int, db_file: str | None = None) -> WorksheetOut:
+    """按入账批次号查完整底稿（历史批次结果不可变）。"""
+    with db.get_conn(db_file) as conn, db.read_snapshot(conn):
+        posting = conn.execute(
+            "SELECT * FROM postings WHERE id = ?", (posting_id,)
+        ).fetchone()
+        if posting is None:
+            raise Rejected(f"入账批次 {posting_id} 不存在", 404)
+        return _worksheet_for(conn, posting)
+
+
+def get_latest_worksheet(
+    account: str, security_code: str, db_file: str | None = None
+) -> WorksheetOut:
+    """该账户+证券最近一次成功入账的完整底稿（含采用的公告截止批次）。"""
+    with db.get_conn(db_file) as conn, db.read_snapshot(conn):
+        posting = conn.execute(
+            "SELECT * FROM postings WHERE account = ? AND security_code = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (account, security_code),
+        ).fetchone()
+        if posting is None:
+            raise Rejected(
+                f"账户 {account} 证券 {security_code} 尚无成功入账", 404
+            )
+        return _worksheet_for(conn, posting)
+
+
+def list_trades(
+    account: str, security_code: str, db_file: str | None = None
+) -> list[TradeOut]:
+    """已入库成交清单（按交易日、成交号排序），便于交割单核对。"""
+    with db.get_conn(db_file) as conn, db.read_snapshot(conn):
+        rows = conn.execute(
+            "SELECT trade_no, trade_date, direction, shares, amount, posting_id "
+            "FROM trades WHERE account = ? AND security_code = ? "
+            "ORDER BY trade_date, trade_no",
+            (account, security_code),
+        ).fetchall()
+    return [TradeOut(**dict(r)) for r in rows]

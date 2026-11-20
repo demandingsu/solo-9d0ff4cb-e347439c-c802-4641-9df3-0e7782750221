@@ -73,6 +73,69 @@ CREATE TABLE IF NOT EXISTS corporate_actions (
 
 CREATE INDEX IF NOT EXISTS idx_actions_sec_exdate
     ON corporate_actions (security_code, ex_date);
+
+-- 入账批次：每次成功入账/重算生成一行；失败整体回滚，不留行
+CREATE TABLE IF NOT EXISTS postings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account         TEXT NOT NULL,
+    security_code   TEXT NOT NULL REFERENCES securities(code),
+    closing_date    TEXT NOT NULL,
+    cutoff_batch    INTEGER NOT NULL CHECK (cutoff_batch >= 0),
+    trades_received INTEGER NOT NULL,
+    trades_new      INTEGER NOT NULL,
+    sells_processed INTEGER NOT NULL,
+    cost_carried    REAL NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_postings_acc_sec
+    ON postings (account, security_code);
+
+-- 成交记录（只追加；同 账户+证券+成交号 同值幂等、异值拒收）
+CREATE TABLE IF NOT EXISTS trades (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    account        TEXT NOT NULL,
+    security_code  TEXT NOT NULL REFERENCES securities(code),
+    trade_no       TEXT NOT NULL,
+    trade_date     TEXT NOT NULL,
+    direction      TEXT NOT NULL CHECK (direction IN ('buy', 'sell')),
+    shares         REAL NOT NULL CHECK (shares > 0),
+    amount         REAL CHECK (amount >= 0),
+    posting_id     INTEGER NOT NULL REFERENCES postings(id),
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (account, security_code, trade_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trades_acc_sec
+    ON trades (account, security_code);
+
+-- 底稿明细：每笔卖出从哪笔买入扣了多少股、结转多少成本
+CREATE TABLE IF NOT EXISTS posting_allocations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    posting_id      INTEGER NOT NULL REFERENCES postings(id),
+    sell_trade_no   TEXT NOT NULL,
+    sell_trade_date TEXT NOT NULL,
+    buy_trade_no    TEXT NOT NULL,
+    buy_trade_date  TEXT NOT NULL,
+    shares_deducted REAL NOT NULL,
+    cost_carried    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alloc_posting
+    ON posting_allocations (posting_id);
+
+-- 底稿头寸：结账日各买入批次的剩余股数与剩余成本
+CREATE TABLE IF NOT EXISTS posting_positions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    posting_id       INTEGER NOT NULL REFERENCES postings(id),
+    buy_trade_no     TEXT NOT NULL,
+    buy_trade_date   TEXT NOT NULL,
+    remaining_shares REAL NOT NULL,
+    remaining_cost   REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_posting
+    ON posting_positions (posting_id);
 """
 
 

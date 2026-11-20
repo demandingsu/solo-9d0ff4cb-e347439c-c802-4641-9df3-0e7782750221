@@ -18,8 +18,13 @@ from .models import (
     CorporateActionImportRequest,
     CorporateActionOut,
     ImportResponse,
+    PostingOut,
+    PostingRequest,
+    PostingResponse,
     QuoteImportRequest,
     RawQuote,
+    TradeOut,
+    WorksheetOut,
 )
 from .services import Rejected
 
@@ -32,10 +37,12 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="拆股复权行情 API",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "版本化日行情与拆股/并股公告导入，按入库截止批次返回"
             "前后可比的复权价量。**后来补报的公告不会改写旧批次结果。**"
+            "另提供交割单入账：按账户+证券+结账日+公告截止批次重算"
+            "卖出成本结转与持仓，输出完整底稿；失败整次作废。"
         ),
         lifespan=lifespan,
     )
@@ -144,6 +151,65 @@ def create_app() -> FastAPI:
         cutoff_batch: int | None = Query(None),
     ) -> list[CorporateActionOut]:
         return services.query_actions(security_code, cutoff_batch)
+
+    # ---------- 入账（交割单核对） ----------
+
+    @app.post(
+        "/postings",
+        response_model=PostingResponse,
+        status_code=201,
+        tags=["入账"],
+        summary="入账：补录成交并按公告截止批次重算成本结转与持仓",
+        description=(
+            "指定账户、证券、结账日与公告截止批次。`trades` 非空时先补录成交"
+            "（同号同值只记一次，异值拒收），为空时只用库中成交换批次重算。"
+            "卖出按买入先后逐批扣股，按扣减股数占该批剩余股数比例结转成本"
+            "（四舍五入到分），扣完一批结转全部剩余成本；除权日先调整各笔"
+            "剩余股数（保留碎股，剩余成本不变）再处理当日成交。"
+            "结账日早于任一成交日、重算股数不足或写入失败 => 整次入账作废。"
+        ),
+    )
+    def create_posting(req: PostingRequest) -> PostingResponse:
+        return PostingResponse(**services.create_posting(req))
+
+    @app.get(
+        "/postings",
+        response_model=list[PostingOut],
+        tags=["入账"],
+        summary="入账批次清单（可按账户/证券过滤）",
+    )
+    def list_postings(
+        account: str | None = Query(None),
+        security_code: str | None = Query(None),
+    ) -> list[PostingOut]:
+        return services.list_postings(account, security_code)
+
+    @app.get(
+        "/postings/latest",
+        response_model=WorksheetOut,
+        tags=["入账"],
+        summary="最近一次成功入账的完整底稿（上次采用的公告批次+卖出明细+结账日持仓）",
+    )
+    def latest_worksheet(account: str, security_code: str) -> WorksheetOut:
+        return services.get_latest_worksheet(account, security_code)
+
+    @app.get(
+        "/postings/{posting_id}",
+        response_model=WorksheetOut,
+        tags=["入账"],
+        summary="按入账批次号查完整底稿（历史批次结果不可变）",
+    )
+    def worksheet(posting_id: int) -> WorksheetOut:
+        return services.get_worksheet(posting_id)
+
+    @app.get(
+        "/trades",
+        response_model=list[TradeOut],
+        tags=["入账"],
+        summary="已入库成交清单（按交易日、成交号排序）",
+    )
+    def trades(account: str, security_code: str) -> list[TradeOut]:
+        return services.list_trades(account, security_code)
 
     return app
 
